@@ -8,6 +8,9 @@
 
 static void Usage(int argc, char *argv[]);
 static void Print_help(void);
+static int  Send_and_wait_ack(int sock, ncp_msg *msg,
+                struct sockaddr *addr, socklen_t addrlen,
+                ncp_msg *reply_out);
 
 /* Global configuration parameters (from command line) */
 static int Loss_rate;
@@ -17,19 +20,20 @@ static char *Src_filename;
 static char *Dst_filename;
 static char *Hostname;
 
-#define SETUP_TIMEOUT_SEC 1
-#define SETUP_MAX_RETRIES 5
+#define ACK_TIMEOUT_SEC 1
+#define MAX_RETRIES 5
 
 int main(int argc, char *argv[]) {
     struct addrinfo hints, *servinfo, *servaddr;
     int             sock;
     int             ret;
     ncp_msg         setup_msg;
-    ncp_msg         recvd_msg;
-    fd_set          mask, read_mask;
-    struct timeval  timeout;
-    int             attempt;
-    int             setup_acked;
+    ncp_msg         reply_msg;
+    FILE           *fin;
+    ncp_msg         data_msg;
+    size_t          nread;
+    int             seq;
+    long            total_bytes_sent;
 
     /* Initialize */
     Usage(argc, argv);
@@ -44,6 +48,12 @@ int main(int argc, char *argv[]) {
         printf("\tMode = LAN\n");
     } else { /*(Mode == WAN)*/
         printf("\tMode = WAN\n");
+    }
+
+    fin = fopen(Src_filename, "rb");
+    if (fin == NULL) {
+        perror("ncp: fopen (source file)");
+        exit(1);
     }
 
     memset(&hints, 0, sizeof(hints));
@@ -76,81 +86,134 @@ int main(int argc, char *argv[]) {
     setup_msg.payload_len = (int)strlen(Dst_filename) + 1; /* include '\0' */
     memcpy(setup_msg.payload, Dst_filename, setup_msg.payload_len);
 
+    ret = Send_and_wait_ack(sock, &setup_msg, servaddr->ai_addr,
+                            servaddr->ai_addrlen, &reply_msg);
+
+    if (ret == 0) {
+        fprintf(stderr, "Giving up: no SETUP ACK after %d attempts\n", MAX_RETRIES);
+        exit(1);
+    }
+    if (reply_msg.type == MSG_BUSY) {
+        /* For now, treat "busy" the same as "give up". A smarter version
+         * would back off and retry later instead of failing outright. */
+        fprintf(stderr, "Receiver is busy. Try again later.\n");
+        exit(1);
+    }
+
+    seq = 1;
+    total_bytes_sent = 0;
+
+    for (;;) {
+        nread = fread(data_msg.payload, 1, MAX_PAYLOAD, fin);
+ 
+        if (nread > 0) {
+            int is_last = feof(fin); /* fread hit EOF exactly on this read */
+ 
+            data_msg.type        = is_last ? MSG_FIN : MSG_DATA;
+            data_msg.seq         = seq;
+            data_msg.payload_len = (int)nread;
+ 
+            ret = Send_and_wait_ack(sock, &data_msg, servaddr->ai_addr,
+                                    servaddr->ai_addrlen, &reply_msg);
+            if (ret == 0) {
+                fprintf(stderr, "Giving up on seq=%d after %d attempts\n",
+                        seq, MAX_RETRIES);
+                exit(1);
+            }
+
+            total_bytes_sent += nread;
+            printf("Sent %s packet: seq=%d payload_len=%d, ACKed (total sent: %ld bytes)\n",
+                is_last ? "FIN" : "DATA", seq, data_msg.payload_len,
+                total_bytes_sent);
+ 
+            seq++;
+ 
+            if (is_last) {
+                break;
+            }
+        } else {
+            if (feof(fin)) {
+                data_msg.type        = MSG_FIN;
+                data_msg.seq         = seq;
+                data_msg.payload_len = 0;
+ 
+                ret = sendto_dbg(sock, (char *)&data_msg, sizeof(data_msg), 0,
+                                  servaddr->ai_addr, servaddr->ai_addrlen);
+                if (ret < 0) {
+                    perror("ncp: sendto_dbg (fin)");
+                    exit(1);
+                }
+                printf("Sent empty FIN packet: seq=%d (total sent: %ld bytes)\n",
+                       seq, total_bytes_sent);
+            } else {
+                perror("ncp: fread (source file)");
+            }
+            break;
+        }
+    }
+ 
+    fclose(fin);
+    freeaddrinfo(servinfo);
+    close(sock);
+ 
+    return 0;
+}
+
+static int Send_and_wait_ack(int sock, ncp_msg *msg,
+                              struct sockaddr *addr, socklen_t addrlen,
+                              ncp_msg *reply_out) {
+    fd_set         mask, read_mask;
+    struct timeval timeout;
+    int            attempt;
+    int            ret;
+ 
     FD_ZERO(&read_mask);
     FD_SET(sock, &read_mask);
-
-    setup_acked = 0;
-    for (attempt = 1; attempt <= SETUP_MAX_RETRIES && !setup_acked; attempt++) {
  
-        ret = sendto_dbg(sock, (char *)&setup_msg, sizeof(setup_msg), 0,
-                          servaddr->ai_addr, servaddr->ai_addrlen);
+    for (attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+ 
+        ret = sendto_dbg(sock, (char *)msg, sizeof(*msg), 0, addr, addrlen);
         if (ret < 0) {
-            perror("ncp: sendto_dbg (setup)");
-            exit(1);
+            perror("ncp: sendto_dbg");
+            return 0;
         }
-        printf("Sent SETUP (attempt %d/%d), waiting for ACK...\n",
-               attempt, SETUP_MAX_RETRIES);
  
-        mask    = read_mask;
-        timeout.tv_sec  = SETUP_TIMEOUT_SEC;
+        mask = read_mask;
+        timeout.tv_sec  = ACK_TIMEOUT_SEC;
         timeout.tv_usec = 0;
  
         ret = select(FD_SETSIZE, &mask, NULL, NULL, &timeout);
         if (ret < 0) {
             perror("ncp: select");
-            exit(1);
+            return 0;
         } else if (ret == 0) {
-            /* Timed out waiting for a response -- loop around and resend. */
-            printf("Timed out waiting for SETUP ACK, retrying...\n");
+            /* Timed out -- loop around and resend the same packet. */
+            printf("  (timeout on seq=%d attempt %d/%d, resending)\n",
+                   msg->seq, attempt, MAX_RETRIES);
             continue;
         }
  
         if (FD_ISSET(sock, &mask)) {
-            ret = recvfrom(sock, &recvd_msg, sizeof(recvd_msg), 0, NULL, NULL);
+            ret = recvfrom(sock, reply_out, sizeof(*reply_out), 0, NULL, NULL);
             if (ret < 0) {
                 perror("ncp: recvfrom");
                 continue;
             }
  
-            if (recvd_msg.type == MSG_ACK) {
-                printf("Received SETUP ACK. Ready to send data.\n");
-                setup_acked = 1;
-            } else if (recvd_msg.type == MSG_BUSY) {
-                printf("Receiver is busy with another transfer. Retrying...\n");
-            } else {
-                printf("Received unexpected type=%d while waiting for SETUP ACK\n",
-                       recvd_msg.type);
+            if (reply_out->type == MSG_BUSY) {
+                return 1; /* caller decides what to do with BUSY */
             }
+            if (reply_out->type == MSG_ACK && reply_out->seq == msg->seq) {
+                return 1; /* matching ACK -- success */
+            }
+            /* Anything else (stale ACK from an earlier retry, garbage,
+             * etc.) -- ignore it and keep waiting/retrying. */
+            printf("  (got type=%d seq=%d while waiting for ack of seq=%d, ignoring)\n",
+                   reply_out->type, reply_out->seq, msg->seq);
         }
     }
-
-    if (!setup_acked) {
-        fprintf(stderr, "Giving up: no SETUP ACK after %d attempts\n",
-                SETUP_MAX_RETRIES);
-        exit(1);
-    }
  
-    {
-        ncp_msg data_msg;
-        data_msg.type        = MSG_DATA;
-        data_msg.seq         = 1;
-        data_msg.payload_len = 5;
-        memcpy(data_msg.payload, "hello", 5);
- 
-        ret = sendto_dbg(sock, (char *)&data_msg, sizeof(data_msg), 0,
-                          servaddr->ai_addr, servaddr->ai_addrlen);
-        if (ret < 0) {
-            perror("ncp: sendto_dbg (data)");
-            exit(1);
-        }
-        printf("Sent test DATA packet: seq=%d payload_len=%d\n",
-               data_msg.seq, data_msg.payload_len);
-    }
- 
-    freeaddrinfo(servinfo);
-    close(sock);
- 
-    return 0;
+    return 0; /* exhausted retries with no matching reply */
 }
 
 /* Read commandline arguments */
