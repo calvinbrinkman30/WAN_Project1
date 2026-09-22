@@ -17,11 +17,19 @@ static char *Src_filename;
 static char *Dst_filename;
 static char *Hostname;
 
+#define SETUP_TIMEOUT_SEC 1
+#define SETUP_MAX_RETRIES 5
+
 int main(int argc, char *argv[]) {
     struct addrinfo hints, *servinfo, *servaddr;
     int             sock;
     int             ret;
-    ncp_msg         send_msg;
+    ncp_msg         setup_msg;
+    ncp_msg         recvd_msg;
+    fd_set          mask, read_mask;
+    struct timeval  timeout;
+    int             attempt;
+    int             setup_acked;
 
     /* Initialize */
     Usage(argc, argv);
@@ -61,22 +69,83 @@ int main(int argc, char *argv[]) {
         fprintf(stderr, "No valid address found...exiting\n");
         exit(1);
     }
-/* Build one hardcoded DATA packet, just to test that the wire format
+    /* Build one hardcoded DATA packet, just to test that the wire format
      * round-trips correctly. No window, no file reading yet. */
-    send_msg.type        = MSG_DATA;
-    send_msg.seq         = 1;
-    send_msg.payload_len = 5;
-    memcpy(send_msg.payload, "hello", 5);
+    setup_msg.type        = MSG_SETUP;
+    setup_msg.seq         = 0;
+    setup_msg.payload_len = (int)strlen(Dst_filename) + 1; /* include '\0' */
+    memcpy(setup_msg.payload, Dst_filename, setup_msg.payload_len);
+
+    FD_ZERO(&read_mask);
+    FD_SET(sock, &read_mask);
+
+    setup_acked = 0;
+    for (attempt = 1; attempt <= SETUP_MAX_RETRIES && !setup_acked; attempt++) {
  
-    ret = sendto_dbg(sock, (char *)&send_msg, sizeof(send_msg), 0,
-                      servaddr->ai_addr, servaddr->ai_addrlen);
-    if (ret < 0) {
-        perror("ncp: sendto_dbg");
+        ret = sendto_dbg(sock, (char *)&setup_msg, sizeof(setup_msg), 0,
+                          servaddr->ai_addr, servaddr->ai_addrlen);
+        if (ret < 0) {
+            perror("ncp: sendto_dbg (setup)");
+            exit(1);
+        }
+        printf("Sent SETUP (attempt %d/%d), waiting for ACK...\n",
+               attempt, SETUP_MAX_RETRIES);
+ 
+        mask    = read_mask;
+        timeout.tv_sec  = SETUP_TIMEOUT_SEC;
+        timeout.tv_usec = 0;
+ 
+        ret = select(FD_SETSIZE, &mask, NULL, NULL, &timeout);
+        if (ret < 0) {
+            perror("ncp: select");
+            exit(1);
+        } else if (ret == 0) {
+            /* Timed out waiting for a response -- loop around and resend. */
+            printf("Timed out waiting for SETUP ACK, retrying...\n");
+            continue;
+        }
+ 
+        if (FD_ISSET(sock, &mask)) {
+            ret = recvfrom(sock, &recvd_msg, sizeof(recvd_msg), 0, NULL, NULL);
+            if (ret < 0) {
+                perror("ncp: recvfrom");
+                continue;
+            }
+ 
+            if (recvd_msg.type == MSG_ACK) {
+                printf("Received SETUP ACK. Ready to send data.\n");
+                setup_acked = 1;
+            } else if (recvd_msg.type == MSG_BUSY) {
+                printf("Receiver is busy with another transfer. Retrying...\n");
+            } else {
+                printf("Received unexpected type=%d while waiting for SETUP ACK\n",
+                       recvd_msg.type);
+            }
+        }
+    }
+
+    if (!setup_acked) {
+        fprintf(stderr, "Giving up: no SETUP ACK after %d attempts\n",
+                SETUP_MAX_RETRIES);
         exit(1);
     }
  
-    printf("Sent test packet: type=%d seq=%d payload_len=%d (%d bytes total)\n",
-           send_msg.type, send_msg.seq, send_msg.payload_len, ret);
+    {
+        ncp_msg data_msg;
+        data_msg.type        = MSG_DATA;
+        data_msg.seq         = 1;
+        data_msg.payload_len = 5;
+        memcpy(data_msg.payload, "hello", 5);
+ 
+        ret = sendto_dbg(sock, (char *)&data_msg, sizeof(data_msg), 0,
+                          servaddr->ai_addr, servaddr->ai_addrlen);
+        if (ret < 0) {
+            perror("ncp: sendto_dbg (data)");
+            exit(1);
+        }
+        printf("Sent test DATA packet: seq=%d payload_len=%d\n",
+               data_msg.seq, data_msg.payload_len);
+    }
  
     freeaddrinfo(servinfo);
     close(sock);

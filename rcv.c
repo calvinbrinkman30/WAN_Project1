@@ -21,7 +21,11 @@ int main(int argc, char *argv[]) {
     fd_set                  mask, read_mask;
     int                     bytes, num, ret;
     ncp_msg                 recvd_msg;
+    ncp_msg                 ack_msg;
     char                    hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
+
+    //currently in progress on this receiver
+    FILE *fout = NULL;
 
     /* Initialize */
     Usage(argc, argv);
@@ -85,9 +89,67 @@ int main(int argc, char *argv[]) {
             sizeof(hbuf), sbuf, sizeof(sbuf),
             NI_NUMERICHOST | NI_NUMERICSERV);
 
-        printf("Received %d bytes from %s:%s -> type=%d seq=%d payload_len=%d\n",
-            bytes, hbuf, sbuf, recvd_msg.type, recvd_msg.seq,
-            recvd_msg.payload_len);
+        switch (recvd_msg.type) {
+ 
+            case MSG_SETUP:
+                /* recvd_msg.payload holds the destination filename,
+                 * null-terminated, with recvd_msg.payload_len bytes
+                 * (including the null terminator). */
+ 
+                if (fout == NULL) {
+                    /* No transfer in progress yet -- this is a fresh SETUP.
+                     * Open (or create/truncate) the destination file for
+                     * writing. */
+                    fout = fopen(recvd_msg.payload, "wb");
+                    if (fout == NULL) {
+                        perror("rcv: fopen (destination file)");
+                        /* Don't ACK -- sender will retry, and we'll try
+                         * again on the next SETUP if the problem was
+                         * transient. If it's a permissions issue this will
+                         * just keep failing, which is acceptable for now. */
+                        continue;
+                    }
+                    printf("Received SETUP from %s:%s -- saving to '%s'\n",
+                           hbuf, sbuf, recvd_msg.payload);
+                } else {
+                    /* We already opened the file. This SETUP is either a
+                     * duplicate (our earlier ACK was lost) or a second
+                     * sender trying to start a new transfer while we're
+                     * busy. For now we just re-ACK; distinguishing these
+                     * two cases (and sending MSG_BUSY for the second one)
+                     * is a later step. */
+                    printf("Received duplicate/second SETUP from %s:%s\n",
+                           hbuf, sbuf);
+                }
+ 
+                /* ACK the SETUP so the sender can stop retrying it and
+                 * move on to sending data. */
+                ack_msg.type        = MSG_ACK;
+                ack_msg.seq         = 0;
+                ack_msg.payload_len = 0;
+                ret = sendto_dbg(sock, (char *)&ack_msg, sizeof(ack_msg), 0,
+                                  (struct sockaddr *)&from_addr, from_len);
+                if (ret < 0) {
+                    perror("rcv: sendto_dbg (setup ack)");
+                }
+                break;
+ 
+            case MSG_DATA:
+                /* File-writing and windowing logic goes here next. For now
+                 * just report what arrived, same as before. */
+                printf("Received DATA from %s:%s -> seq=%d payload_len=%d\n",
+                       hbuf, sbuf, recvd_msg.seq, recvd_msg.payload_len);
+                break;
+ 
+            default:
+                printf("Received unexpected type=%d from %s:%s\n",
+                       recvd_msg.type, hbuf, sbuf);
+                break;
+        }
+    }
+
+    if (fout != NULL) {
+        fclose(fout);
     }
     close(sock);
     return 0;
