@@ -7,11 +7,22 @@
 
 static void Usage(int argc, char *argv[]);
 static void Print_help(void);
+static double Elapsed_sec(struct timeval *since);
 
-/* Global configuration parameters (from command line) */
 static int Loss_rate;
 static int Mode;
 static char *Port_Str;
+
+#define WINDOW_SIZE 8
+#define MB 1000000.0
+
+typedef struct {
+    int      received;
+    ncp_msg  pkt;
+} recv_slot_t;
+
+static void Send_msg(int sock, ncp_msg *msg, struct sockaddr *addr, socklen_t addrlen,
+                      const char *what);
 
 int main(int argc, char *argv[]) {
     struct addrinfo         hints, *servinfo, *servaddr;
@@ -21,15 +32,21 @@ int main(int argc, char *argv[]) {
     fd_set                  mask, read_mask;
     int                     bytes, num, ret;
     ncp_msg                 recvd_msg;
-    ncp_msg                 ack_msg;
+    ncp_msg                 ack_msg, nack_msg;
     char                    hbuf[NI_MAXHOST], sbuf[NI_MAXSERV];
     long                    total_bytes_written;
 
-    //currently in progress on this receiver
-    FILE *fout = NULL;
-    int expected_seq = 1;
+    FILE        *fout = NULL;
+    int          expected_seq = 1;
+    recv_slot_t  window[WINDOW_SIZE];
+    int          i;
+    char         active_hbuf[NI_MAXHOST] = "";
+    char         active_sbuf[NI_MAXSERV] = "";
 
-    /* Initialize */
+    struct timeval xfer_start_time;
+    struct timeval last_report_time;
+    long            last_report_bytes;
+
     Usage(argc, argv);
     sendto_dbg_init(Loss_rate);
     printf("Successfully initialized with:\n");
@@ -37,14 +54,19 @@ int main(int argc, char *argv[]) {
     printf("\tPort = %s\n", Port_Str);
     if (Mode == MODE_LAN) {
         printf("\tMode = LAN\n");
-    } else { /*(Mode == WAN)*/
+    } else {
         printf("\tMode = WAN\n");
+    }
+
+    for (i = 0; i < WINDOW_SIZE; i++) {
+        window[i].received = 0;
     }
 
     memset(&hints, 0, sizeof(hints));
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_DGRAM;
     hints.ai_flags    = AI_PASSIVE;
+
     ret = getaddrinfo(NULL, Port_Str, &hints, &servinfo);
     if (ret != 0) {
         fprintf(stderr, "getaddrinfo error: %s\n", gai_strerror(ret));
@@ -53,52 +75,60 @@ int main(int argc, char *argv[]) {
 
     for (servaddr = servinfo; servaddr != NULL; servaddr = servaddr->ai_next) {
         sock = socket(servaddr->ai_family, servaddr->ai_socktype, servaddr->ai_protocol);
-        if (sock < 0) { 
-            perror("rcv: socket"); 
-            continue; 
+        if (sock < 0) {
+            perror("rcv: socket");
+            continue;
         }
-        if (bind(sock, servaddr->ai_addr, servaddr->ai_addrlen) < 0) { 
+        if (bind(sock, servaddr->ai_addr, servaddr->ai_addrlen) < 0) {
             perror("rcv: bind");
             close(sock);
-            continue; 
+            continue;
         }
-
         break;
+    }
+    if (servaddr == NULL) {
+        fprintf(stderr, "No valid address found...exiting\n");
+        exit(1);
     }
     freeaddrinfo(servinfo);
 
+    printf("Listening on port %s (window size %d)...\n\n", Port_Str, WINDOW_SIZE);
+
     total_bytes_written = 0;
+    last_report_bytes   = 0;
 
     FD_ZERO(&read_mask);
     FD_SET(sock, &read_mask);
- 
+
     for (;;) {
         mask = read_mask;
- 
+
         num = select(FD_SETSIZE, &mask, NULL, NULL, NULL);
         if (num <= 0) {
             continue;
         }
- 
         if (!FD_ISSET(sock, &mask)) {
             continue;
         }
 
         from_len = sizeof(from_addr);
         bytes = recvfrom(sock, &recvd_msg, sizeof(recvd_msg), 0,
-            (struct sockaddr *)&from_addr, &from_len);
-
+                          (struct sockaddr *)&from_addr, &from_len);
         if (bytes < 0) {
             perror("rcv: recvfrom");
             continue;
         }
 
         ret = getnameinfo((struct sockaddr *)&from_addr, from_len, hbuf,
-            sizeof(hbuf), sbuf, sizeof(sbuf),
-            NI_NUMERICHOST | NI_NUMERICSERV);
+                           sizeof(hbuf), sbuf, sizeof(sbuf),
+                           NI_NUMERICHOST | NI_NUMERICSERV);
+        if (ret != 0) {
+            fprintf(stderr, "getnameinfo error: %s\n", gai_strerror(ret));
+            continue;
+        }
 
         switch (recvd_msg.type) {
- 
+
             case MSG_SETUP:
                 if (fout == NULL) {
                     fout = fopen(recvd_msg.payload, "wb");
@@ -107,85 +137,171 @@ int main(int argc, char *argv[]) {
                         continue;
                     }
                     total_bytes_written = 0;
+                    last_report_bytes   = 0;
                     expected_seq = 1;
+                    for (i = 0; i < WINDOW_SIZE; i++) {
+                        window[i].received = 0;
+                    }
+                    gettimeofday(&xfer_start_time, NULL);
+                    last_report_time = xfer_start_time;
+                    strncpy(active_hbuf, hbuf, sizeof(active_hbuf) - 1);
+                    active_hbuf[sizeof(active_hbuf) - 1] = '\0';
+                    strncpy(active_sbuf, sbuf, sizeof(active_sbuf) - 1);
+                    active_sbuf[sizeof(active_sbuf) - 1] = '\0';
                     printf("Received SETUP from %s:%s -- saving to '%s'\n",
                            hbuf, sbuf, recvd_msg.payload);
-                } else {
-                    printf("Received duplicate/second SETUP from %s:%s\n",
-                           hbuf, sbuf);
-                }
 
-                ack_msg.type        = MSG_ACK;
-                ack_msg.seq         = 0;
-                ack_msg.payload_len = 0;
-                ret = sendto_dbg(sock, (char *)&ack_msg, sizeof(ack_msg), 0,
-                                  (struct sockaddr *)&from_addr, from_len);
-                if (ret < 0) {
-                    perror("rcv: sendto_dbg (setup ack)");
+                    ack_msg.type        = MSG_ACK;
+                    ack_msg.seq         = 0;
+                    ack_msg.payload_len = 0;
+                    Send_msg(sock, &ack_msg, (struct sockaddr *)&from_addr, from_len,
+                             "setup ack");
+
+                } else if (strcmp(hbuf, active_hbuf) == 0 &&
+                           strcmp(sbuf, active_sbuf) == 0) {
+                    printf("Received duplicate SETUP from %s:%s (same sender)\n",
+                           hbuf, sbuf);
+
+                    ack_msg.type        = MSG_ACK;
+                    ack_msg.seq         = 0;
+                    ack_msg.payload_len = 0;
+                    Send_msg(sock, &ack_msg, (struct sockaddr *)&from_addr, from_len,
+                             "setup ack");
+
+                } else {
+                    printf("Received SETUP from %s:%s but busy with %s:%s "
+                           "-- sending BUSY\n",
+                           hbuf, sbuf, active_hbuf, active_sbuf);
+
+                    ack_msg.type        = MSG_BUSY;
+                    ack_msg.seq         = 0;
+                    ack_msg.payload_len = 0;
+                    Send_msg(sock, &ack_msg, (struct sockaddr *)&from_addr, from_len,
+                             "busy reply");
                 }
                 break;
- 
+
             case MSG_DATA:
             case MSG_FIN:
                 if (fout == NULL) {
-                    printf("Received %s from %s:%s but no transfer is in "
-                           "progress (no prior SETUP) -- dropping\n",
-                           recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
-                           hbuf, sbuf);
+                    if (recvd_msg.type == MSG_FIN &&
+                        recvd_msg.seq == expected_seq - 1) {
+                        printf("Received duplicate FIN seq=%d from %s:%s "
+                               "for an already-completed transfer, re-ACKing\n",
+                               recvd_msg.seq, hbuf, sbuf);
+                        ack_msg.type        = MSG_ACK;
+                        ack_msg.seq         = recvd_msg.seq;
+                        ack_msg.payload_len = 0;
+                        Send_msg(sock, &ack_msg, (struct sockaddr *)&from_addr,
+                                 from_len, "late fin ack");
+                    } else {
+                        printf("Received %s seq=%d from %s:%s but no "
+                               "transfer is in progress -- dropping\n",
+                               recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
+                               recvd_msg.seq, hbuf, sbuf);
+                    }
                     break;
                 }
- 
-                if (recvd_msg.seq == expected_seq) {
-                    if (recvd_msg.payload_len > 0) {
-                        size_t nwritten = fwrite(recvd_msg.payload, 1,
-                                                  recvd_msg.payload_len, fout);
-                        if (nwritten < (size_t)recvd_msg.payload_len) {
-                            perror("rcv: fwrite");
-                        } else {
-                            total_bytes_written += nwritten;
-                        }
-                    }
- 
-                    printf("Received %s from %s:%s -> seq=%d payload_len=%d "
-                           "(total written: %ld bytes)\n",
-                           recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
-                           hbuf, sbuf, recvd_msg.seq, recvd_msg.payload_len,
-                           total_bytes_written);
- 
-                    expected_seq++;
- 
-                } else if (recvd_msg.seq < expected_seq) {
+
+                if (recvd_msg.seq < expected_seq) {
                     printf("Received duplicate %s seq=%d from %s:%s "
-                           "(already have it, re-ACKing)\n",
+                           "(already delivered, re-ACKing)\n",
                            recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
                            recvd_msg.seq, hbuf, sbuf);
-                } else {
-                    printf("Received out-of-order %s seq=%d from %s:%s "
-                           "(expected %d) -- dropping\n",
+
+                } else if (recvd_msg.seq >= expected_seq + WINDOW_SIZE) {
+                    printf("Received %s seq=%d from %s:%s -- outside "
+                           "receive window (expected %d..%d), dropping\n",
                            recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
-                           recvd_msg.seq, hbuf, sbuf, expected_seq);
-                    break; /* don't ACK -- we didn't accept this one */
+                           recvd_msg.seq, hbuf, sbuf, expected_seq,
+                           expected_seq + WINDOW_SIZE - 1);
+                    break;
+
+                } else {
+                    int slot = recvd_msg.seq % WINDOW_SIZE;
+
+                    if (!window[slot].received) {
+                        window[slot].received = 1;
+                        window[slot].pkt       = recvd_msg;
+                    }
+
+                    while (window[expected_seq % WINDOW_SIZE].received) {
+                        int      idx = expected_seq % WINDOW_SIZE;
+                        ncp_msg *p   = &window[idx].pkt;
+
+                        if (p->payload_len > 0) {
+                            size_t nwritten = fwrite(p->payload, 1,
+                                                      p->payload_len, fout);
+                            if (nwritten < (size_t)p->payload_len) {
+                                perror("rcv: fwrite");
+                            } else {
+                                total_bytes_written += nwritten;
+                            }
+                        }
+
+                        printf("Delivered %s seq=%d payload_len=%d "
+                               "(total written: %ld bytes)\n",
+                               p->type == MSG_FIN ? "FIN" : "DATA",
+                               p->seq, p->payload_len, total_bytes_written);
+
+                        if (total_bytes_written - last_report_bytes >= (long)(10 * MB)) {
+                            double elapsed = Elapsed_sec(&last_report_time);
+                            double rate_mbps = elapsed > 0
+                                ? ((total_bytes_written - last_report_bytes) * 8.0 / MB) / elapsed
+                                : 0.0;
+                            printf("[rcv] %.2f MB received so far, "
+                                   "last interval rate %.2f Mbps\n",
+                                   total_bytes_written / MB, rate_mbps);
+                            last_report_bytes = total_bytes_written;
+                            gettimeofday(&last_report_time, NULL);
+                        }
+
+                        if (p->type == MSG_FIN) {
+                            double total_time    = Elapsed_sec(&xfer_start_time);
+                            double file_size_mb  = total_bytes_written / MB;
+                            double avg_rate_mbps = total_time > 0
+                                ? (total_bytes_written * 8.0 / MB) / total_time
+                                : 0.0;
+
+                            fclose(fout);
+                            fout = NULL;
+
+                            printf("\n[rcv] Transfer complete.\n");
+                            printf("[rcv] File size: %.4f MB\n", file_size_mb);
+                            printf("[rcv] Transfer time: %.4f sec\n", total_time);
+                            printf("[rcv] Average rate: %.4f Mbps\n\n", avg_rate_mbps);
+                        }
+
+                        window[idx].received = 0;
+                        expected_seq++;
+
+                        if (fout == NULL) {
+                            break;
+                        }
+                    }
+
+                    {
+                        int k;
+                        for (k = expected_seq; k < recvd_msg.seq; k++) {
+                            if (!window[k % WINDOW_SIZE].received) {
+                                nack_msg.type        = MSG_NACK;
+                                nack_msg.seq         = k;
+                                nack_msg.payload_len = 0;
+                                Send_msg(sock, &nack_msg,
+                                         (struct sockaddr *)&from_addr, from_len,
+                                         "nack");
+                            }
+                        }
+                    }
                 }
 
-                                ack_msg.type        = MSG_ACK;
-                ack_msg.seq         = recvd_msg.seq;
+                ack_msg.type        = MSG_ACK;
+                ack_msg.seq         = expected_seq - 1;
                 ack_msg.payload_len = 0;
-                ret = sendto_dbg(sock, (char *)&ack_msg, sizeof(ack_msg), 0,
-                                  (struct sockaddr *)&from_addr, from_len);
-                if (ret < 0) {
-                    perror("rcv: sendto_dbg (data ack)");
-                }
- 
-                if (recvd_msg.type == MSG_FIN && recvd_msg.seq == expected_seq - 1) {
-                    /* We just accepted the FIN (not a duplicate re-ACK of
-                     * an old FIN) -- close out the transfer. */
-                    fclose(fout);
-                    fout = NULL;
-                    printf("Transfer complete. Wrote %ld bytes.\n\n",
-                           total_bytes_written);
-                }
+                Send_msg(sock, &ack_msg, (struct sockaddr *)&from_addr, from_len,
+                         "cumulative ack");
                 break;
- 
+
             default:
                 printf("Received unexpected type=%d from %s:%s\n",
                        recvd_msg.type, hbuf, sbuf);
@@ -196,13 +312,27 @@ int main(int argc, char *argv[]) {
     if (fout != NULL) {
         fclose(fout);
     }
-
     close(sock);
     return 0;
-    //if (servaddr == NULL) { fprintf(stderr, "No valid address found...exiting\n"); exit(1); }
 }
 
-/* Read commandline arguments */
+static double Elapsed_sec(struct timeval *since) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (now.tv_sec - since->tv_sec) +
+           (now.tv_usec - since->tv_usec) / 1000000.0;
+}
+
+static void Send_msg(int sock, ncp_msg *msg, struct sockaddr *addr, socklen_t addrlen,
+                      const char *what) {
+    int ret = sendto_dbg(sock, (char *)msg, sizeof(*msg), 0, addr, addrlen);
+    if (ret < 0) {
+        char errmsg[64];
+        snprintf(errmsg, sizeof(errmsg), "rcv: sendto_dbg (%s)", what);
+        perror(errmsg);
+    }
+}
+
 static void Usage(int argc, char *argv[]) {
     if (argc != 4) {
         Print_help();

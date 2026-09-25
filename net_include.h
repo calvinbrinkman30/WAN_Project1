@@ -24,7 +24,7 @@ enum {
 
 typedef struct dummy_ncp_msg {
     /* Fill in header information needed for your protocol */
-    char payload[MAX_MESS_LEN];
+    char payload[MAX_PAYLOAD];
     int32_t type;
     int32_t seq;
     int32_t payload_len;
