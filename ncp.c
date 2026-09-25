@@ -11,7 +11,8 @@ static void Print_help(void);
 static int  Send_and_wait_ack(int sock, ncp_msg *msg,
                 struct sockaddr *addr, socklen_t addrlen,
                 ncp_msg *reply_out);
-static long Elapsed_ms(struct timeval *since);
+static long   Elapsed_ms(struct timeval *since);
+static double Elapsed_sec(struct timeval *since);
 
 static int Loss_rate;
 static int Mode;
@@ -22,9 +23,14 @@ static char *Hostname;
 
 #define ACK_TIMEOUT_SEC 1
 #define MAX_RETRIES     5
-#define WINDOW_SIZE  8
+
+#define WINDOW_SIZE_LAN 4
+#define WINDOW_SIZE_WAN 500
+#define WINDOW_SIZE_MAX 500
+
 #define POLL_INTERVAL_MS 100
 #define DATA_RTO_MS 500
+#define MB 1000000.0
 
 typedef struct {
     int             in_use;
@@ -40,13 +46,19 @@ int main(int argc, char *argv[]) {
     ncp_msg         reply_msg;
     FILE           *fin;
 
-    send_slot_t     window[WINDOW_SIZE];
+    static send_slot_t window[WINDOW_SIZE_MAX];
+    int             window_size;
     int             base_seq;
     int             next_seq;
     int             fin_seq;
     int             file_eof;
     long            total_bytes_acked;
     long            total_pkts_sent_incl_retrans;
+    long            total_bytes_sent_incl_retrans;
+
+    struct timeval  xfer_start_time;
+    struct timeval  last_report_time;
+    long            last_report_bytes;
 
     int             i;
 
@@ -60,8 +72,10 @@ int main(int argc, char *argv[]) {
     printf("\tPort = %s\n", Port_Str);
     if (Mode == MODE_LAN) {
         printf("\tMode = LAN\n");
+        window_size = WINDOW_SIZE_LAN;
     } else {
         printf("\tMode = WAN\n");
+        window_size = WINDOW_SIZE_WAN;
     }
 
     fin = fopen(Src_filename, "rb");
@@ -111,22 +125,27 @@ int main(int argc, char *argv[]) {
         exit(1);
     }
     printf("SETUP ACKed. Starting windowed data transfer (window size %d)...\n",
-           WINDOW_SIZE);
+           window_size);
 
-    for (i = 0; i < WINDOW_SIZE; i++) {
+    gettimeofday(&xfer_start_time, NULL);
+    last_report_time  = xfer_start_time;
+    last_report_bytes = 0;
+
+    for (i = 0; i < window_size; i++) {
         window[i].in_use = 0;
     }
-    base_seq                     = 1;
-    next_seq                     = 1;
-    fin_seq                      = -1;
-    file_eof                     = 0;
-    total_bytes_acked            = 0;
-    total_pkts_sent_incl_retrans  = 0;
+    base_seq                      = 1;
+    next_seq                      = 1;
+    fin_seq                       = -1;
+    file_eof                      = 0;
+    total_bytes_acked             = 0;
+    total_pkts_sent_incl_retrans   = 0;
+    total_bytes_sent_incl_retrans  = 0;
 
     while (!file_eof || base_seq <= fin_seq) {
 
-        while (!file_eof && next_seq < base_seq + WINDOW_SIZE) {
-            ncp_msg  *pkt = &window[next_seq % WINDOW_SIZE].pkt;
+        while (!file_eof && next_seq < base_seq + window_size) {
+            ncp_msg  *pkt = &window[next_seq % window_size].pkt;
             size_t    nread;
 
             nread = fread(pkt->payload, 1, MAX_PAYLOAD, fin);
@@ -145,9 +164,10 @@ int main(int argc, char *argv[]) {
                     exit(1);
                 }
                 total_pkts_sent_incl_retrans++;
+                total_bytes_sent_incl_retrans += sizeof(*pkt);
 
-                window[next_seq % WINDOW_SIZE].in_use = 1;
-                gettimeofday(&window[next_seq % WINDOW_SIZE].sent_time, NULL);
+                window[next_seq % window_size].in_use = 1;
+                gettimeofday(&window[next_seq % window_size].sent_time, NULL);
 
                 printf("Sent %s seq=%d payload_len=%d (window has %d..%d in flight)\n",
                        is_last ? "FIN" : "DATA", next_seq, pkt->payload_len,
@@ -171,9 +191,10 @@ int main(int argc, char *argv[]) {
                     exit(1);
                 }
                 total_pkts_sent_incl_retrans++;
+                total_bytes_sent_incl_retrans += sizeof(*pkt);
 
-                window[next_seq % WINDOW_SIZE].in_use = 1;
-                gettimeofday(&window[next_seq % WINDOW_SIZE].sent_time, NULL);
+                window[next_seq % window_size].in_use = 1;
+                gettimeofday(&window[next_seq % window_size].sent_time, NULL);
 
                 printf("Sent empty FIN seq=%d\n", next_seq);
 
@@ -216,7 +237,7 @@ int main(int argc, char *argv[]) {
                         if (reply.seq >= base_seq) {
                             int s;
                             for (s = base_seq; s <= reply.seq; s++) {
-                                int idx = s % WINDOW_SIZE;
+                                int idx = s % window_size;
                                 if (window[idx].in_use && window[idx].pkt.seq == s) {
                                     total_bytes_acked += window[idx].pkt.payload_len;
                                     window[idx].in_use = 0;
@@ -225,10 +246,22 @@ int main(int argc, char *argv[]) {
                             base_seq = reply.seq + 1;
                             printf("  ACK seq=%d -- window base now %d\n",
                                    reply.seq, base_seq);
+
+                            if (total_bytes_acked - last_report_bytes >= (long)(10 * MB)) {
+                                double elapsed = Elapsed_sec(&last_report_time);
+                                double rate_mbps = elapsed > 0
+                                    ? ((total_bytes_acked - last_report_bytes) * 8.0 / MB) / elapsed
+                                    : 0.0;
+                                printf("[ncp] %.2f MB transferred so far, "
+                                       "last interval rate %.2f Mbps\n",
+                                       total_bytes_acked / MB, rate_mbps);
+                                last_report_bytes = total_bytes_acked;
+                                gettimeofday(&last_report_time, NULL);
+                            }
                         }
 
                     } else if (reply.type == MSG_NACK) {
-                        int idx = reply.seq % WINDOW_SIZE;
+                        int idx = reply.seq % window_size;
                         if (window[idx].in_use && window[idx].pkt.seq == reply.seq) {
                             ret = sendto_dbg(sock, (char *)&window[idx].pkt,
                                               sizeof(window[idx].pkt), 0,
@@ -237,6 +270,7 @@ int main(int argc, char *argv[]) {
                                 perror("ncp: sendto_dbg (nack resend)");
                             } else {
                                 total_pkts_sent_incl_retrans++;
+                                total_bytes_sent_incl_retrans += sizeof(window[idx].pkt);
                                 gettimeofday(&window[idx].sent_time, NULL);
                                 printf("  NACK seq=%d -- resent\n", reply.seq);
                             }
@@ -246,7 +280,7 @@ int main(int argc, char *argv[]) {
             }
         }
 
-        for (i = 0; i < WINDOW_SIZE; i++) {
+        for (i = 0; i < window_size; i++) {
             if (window[i].in_use && Elapsed_ms(&window[i].sent_time) >= DATA_RTO_MS) {
                 ret = sendto_dbg(sock, (char *)&window[i].pkt,
                                   sizeof(window[i].pkt), 0,
@@ -255,6 +289,7 @@ int main(int argc, char *argv[]) {
                     perror("ncp: sendto_dbg (timeout resend)");
                 } else {
                     total_pkts_sent_incl_retrans++;
+                    total_bytes_sent_incl_retrans += sizeof(window[i].pkt);
                     gettimeofday(&window[i].sent_time, NULL);
                     printf("  (timeout) resent seq=%d\n", window[i].pkt.seq);
                 }
@@ -262,9 +297,21 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    printf("\nTransfer complete. %ld unique bytes delivered, %ld packets sent "
-           "total (including retransmissions).\n",
-           total_bytes_acked, total_pkts_sent_incl_retrans);
+    {
+        double total_time    = Elapsed_sec(&xfer_start_time);
+        double file_size_mb  = total_bytes_acked / MB;
+        double avg_rate_mbps = total_time > 0
+            ? (total_bytes_acked * 8.0 / MB) / total_time
+            : 0.0;
+        double sent_incl_retrans_mb = total_bytes_sent_incl_retrans / MB;
+
+        printf("\n[ncp] Transfer complete.\n");
+        printf("[ncp] File size: %.4f MB\n", file_size_mb);
+        printf("[ncp] Transfer time: %.4f sec\n", total_time);
+        printf("[ncp] Average rate: %.4f Mbps\n", avg_rate_mbps);
+        printf("[ncp] Total data sent including retransmissions: %.4f MB\n",
+               sent_incl_retrans_mb);
+    }
 
     fclose(fin);
     freeaddrinfo(servinfo);
@@ -282,6 +329,13 @@ static long Elapsed_ms(struct timeval *since) {
     usec_diff = now.tv_usec - since->tv_usec;
 
     return (sec_diff * 1000) + (usec_diff / 1000);
+}
+
+static double Elapsed_sec(struct timeval *since) {
+    struct timeval now;
+    gettimeofday(&now, NULL);
+    return (now.tv_sec - since->tv_sec) +
+           (now.tv_usec - since->tv_usec) / 1000000.0;
 }
 
 static int Send_and_wait_ack(int sock, ncp_msg *msg,
