@@ -40,7 +40,8 @@ int main(int argc, char *argv[]) {
 
     FILE        *fout = NULL;
     int          expected_seq = 1;
-    recv_slot_t  window[WINDOW_SIZE];
+    static recv_slot_t window[WINDOW_SIZE_MAX];
+    int          window_size;
     int          i;
     char         active_hbuf[NI_MAXHOST] = "";
     char         active_sbuf[NI_MAXSERV] = "";
@@ -55,11 +56,13 @@ int main(int argc, char *argv[]) {
     printf("\tPort = %s\n", Port_Str);
     if (Mode == MODE_LAN) {
         printf("\tMode = LAN\n");
+        window_size = WINDOW_SIZE_LAN;
     } else {
         printf("\tMode = WAN\n");
+        window_size = WINDOW_SIZE_WAN;
     }
 
-    for (i = 0; i < WINDOW_SIZE; i++) {
+    for (i = 0; i < window_size; i++) {
         window[i].received = 0;
     }
 
@@ -93,7 +96,7 @@ int main(int argc, char *argv[]) {
     }
     freeaddrinfo(servinfo);
 
-    printf("Listening on port %s (window size %d)...\n\n", Port_Str, WINDOW_SIZE);
+    printf("Listening on port %s (window size %d)...\n\n", Port_Str, window_size);
 
     total_bytes_written = 0;
     last_report_bytes   = 0;
@@ -140,7 +143,7 @@ int main(int argc, char *argv[]) {
                     total_bytes_written = 0;
                     last_report_bytes   = 0;
                     expected_seq = 1;
-                    for (i = 0; i < WINDOW_SIZE; i++) {
+                    for (i = 0; i < window_size; i++) {
                         window[i].received = 0;
                     }
                     gettimeofday(&xfer_start_time, NULL);
@@ -210,24 +213,24 @@ int main(int argc, char *argv[]) {
                            recvd_msg.type == USER_MSG_FIN ? "FIN" : "DATA",
                            recvd_msg.seq, hbuf, sbuf);
 
-                } else if (recvd_msg.seq >= expected_seq + WINDOW_SIZE) {
+                } else if (recvd_msg.seq >= expected_seq + window_size) {
                     printf("Received %s seq=%d from %s:%s -- outside "
                            "receive window (expected %d..%d), dropping\n",
                            recvd_msg.type == USER_MSG_FIN ? "FIN" : "DATA",
                            recvd_msg.seq, hbuf, sbuf, expected_seq,
-                           expected_seq + WINDOW_SIZE - 1);
+                           expected_seq + window_size - 1);
                     break;
 
                 } else {
-                    int slot = recvd_msg.seq % WINDOW_SIZE;
+                    int slot = recvd_msg.seq % window_size;
 
                     if (!window[slot].received) {
                         window[slot].received = 1;
                         window[slot].pkt       = recvd_msg;
                     }
 
-                    while (window[expected_seq % WINDOW_SIZE].received) {
-                        int      idx = expected_seq % WINDOW_SIZE;
+                    while (window[expected_seq % window_size].received) {
+                        int      idx = expected_seq % window_size;
                         ncp_msg *p   = &window[idx].pkt;
 
                         if (p->payload_len > 0) {
@@ -284,7 +287,7 @@ int main(int argc, char *argv[]) {
                     {
                         int k;
                         for (k = expected_seq; k < recvd_msg.seq; k++) {
-                            if (!window[k % WINDOW_SIZE].received) {
+                            if (!window[k % window_size].received) {
                                 nack_msg.type        = MSG_NACK;
                                 nack_msg.seq         = k;
                                 nack_msg.payload_len = 0;
