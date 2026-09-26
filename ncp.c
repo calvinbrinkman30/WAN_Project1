@@ -20,9 +20,10 @@ static char *Src_filename;
 static char *Dst_filename;
 static char *Hostname;
 
-#define ACK_TIMEOUT_SEC 1
-#define MAX_RETRIES     5
-#define WINDOW_SIZE  8
+static int ACK_TIMEOUT_SEC;
+static int ACK_TIMEOUT_USEC;
+#define MAX_RETRIES 5
+static int WINDOW_SIZE;
 #define POLL_INTERVAL_MS 100
 #define DATA_RTO_MS 500
 
@@ -33,6 +34,8 @@ typedef struct {
 } send_slot_t;
 
 int main(int argc, char *argv[]) {
+    Usage(argc, argv);
+    
     struct addrinfo hints, *servinfo, *servaddr;
     int             sock;
     int             ret;
@@ -50,7 +53,6 @@ int main(int argc, char *argv[]) {
 
     int             i;
 
-    Usage(argc, argv);
     sendto_dbg_init(Loss_rate);
     printf("Successfully initialized with:\n");
     printf("\tLoss rate = %d\n", Loss_rate);
@@ -134,7 +136,7 @@ int main(int argc, char *argv[]) {
             if (nread > 0) {
                 int is_last = feof(fin);
 
-                pkt->type        = is_last ? MSG_FIN : MSG_DATA;
+                pkt->type        = is_last ? USER_MSG_FIN : MSG_DATA;
                 pkt->seq         = next_seq;
                 pkt->payload_len = (int)nread;
 
@@ -160,7 +162,7 @@ int main(int argc, char *argv[]) {
                 next_seq++;
 
             } else if (feof(fin)) {
-                pkt->type        = MSG_FIN;
+                pkt->type        = USER_MSG_FIN;
                 pkt->seq         = next_seq;
                 pkt->payload_len = 0;
 
@@ -305,7 +307,7 @@ static int Send_and_wait_ack(int sock, ncp_msg *msg,
 
         mask = read_mask;
         timeout.tv_sec  = ACK_TIMEOUT_SEC;
-        timeout.tv_usec = 0;
+        timeout.tv_usec = ACK_TIMEOUT_USEC;
 
         ret = select(FD_SETSIZE, &mask, NULL, NULL, &timeout);
         if (ret < 0) {
@@ -350,8 +352,14 @@ static void Usage(int argc, char *argv[]) {
 
     if (!strncmp(argv[2], "WAN", 4)) {
         Mode = MODE_WAN;
+        ACK_TIMEOUT_SEC = 0;
+        ACK_TIMEOUT_USEC = 100000; // 100 ms timeout
+        WINDOW_SIZE = 4000;
     } else if (!strncmp(argv[2], "LAN", 4)) {
         Mode = MODE_LAN;
+        ACK_TIMEOUT_SEC = 0;
+        ACK_TIMEOUT_USEC = 200; // 0.2 ms timeout
+        WINDOW_SIZE = 8;
     } else {
         Print_help();
     }
