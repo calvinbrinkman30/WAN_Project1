@@ -19,7 +19,7 @@ enum {
     MSG_NACK = 3,
     MSG_SETUP = 4,
     MSG_BUSY = 5,
-    MSG_FIN = 6
+    USER_MSG_FIN = 6
 };
 
 typedef struct dummy_ncp_msg {

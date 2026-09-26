@@ -13,9 +13,7 @@ static int Loss_rate;
 static int Mode;
 static char *Port_Str;
 
-#define WINDOW_SIZE_LAN 4
-#define WINDOW_SIZE_WAN 500
-#define WINDOW_SIZE_MAX 500
+static int WINDOW_SIZE;
 #define MB 1000000.0
 
 typedef struct {
@@ -27,6 +25,8 @@ static void Send_msg(int sock, ncp_msg *msg, struct sockaddr *addr, socklen_t ad
                       const char *what);
 
 int main(int argc, char *argv[]) {
+    Usage(argc, argv);
+    
     struct addrinfo         hints, *servinfo, *servaddr;
     struct sockaddr_storage from_addr;
     socklen_t               from_len;
@@ -50,7 +50,6 @@ int main(int argc, char *argv[]) {
     struct timeval last_report_time;
     long            last_report_bytes;
 
-    Usage(argc, argv);
     sendto_dbg_init(Loss_rate);
     printf("Successfully initialized with:\n");
     printf("\tLoss rate = %d\n", Loss_rate);
@@ -187,9 +186,9 @@ int main(int argc, char *argv[]) {
                 break;
 
             case MSG_DATA:
-            case MSG_FIN:
+            case USER_MSG_FIN:
                 if (fout == NULL) {
-                    if (recvd_msg.type == MSG_FIN &&
+                    if (recvd_msg.type == USER_MSG_FIN &&
                         recvd_msg.seq == expected_seq - 1) {
                         printf("Received duplicate FIN seq=%d from %s:%s "
                                "for an already-completed transfer, re-ACKing\n",
@@ -202,7 +201,7 @@ int main(int argc, char *argv[]) {
                     } else {
                         printf("Received %s seq=%d from %s:%s but no "
                                "transfer is in progress -- dropping\n",
-                               recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
+                               recvd_msg.type == USER_MSG_FIN ? "FIN" : "DATA",
                                recvd_msg.seq, hbuf, sbuf);
                     }
                     break;
@@ -211,13 +210,13 @@ int main(int argc, char *argv[]) {
                 if (recvd_msg.seq < expected_seq) {
                     printf("Received duplicate %s seq=%d from %s:%s "
                            "(already delivered, re-ACKing)\n",
-                           recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
+                           recvd_msg.type == USER_MSG_FIN ? "FIN" : "DATA",
                            recvd_msg.seq, hbuf, sbuf);
 
                 } else if (recvd_msg.seq >= expected_seq + window_size) {
                     printf("Received %s seq=%d from %s:%s -- outside "
                            "receive window (expected %d..%d), dropping\n",
-                           recvd_msg.type == MSG_FIN ? "FIN" : "DATA",
+                           recvd_msg.type == USER_MSG_FIN ? "FIN" : "DATA",
                            recvd_msg.seq, hbuf, sbuf, expected_seq,
                            expected_seq + window_size - 1);
                     break;
@@ -246,7 +245,7 @@ int main(int argc, char *argv[]) {
 
                         printf("Delivered %s seq=%d payload_len=%d "
                                "(total written: %ld bytes)\n",
-                               p->type == MSG_FIN ? "FIN" : "DATA",
+                               p->type == USER_MSG_FIN ? "FIN" : "DATA",
                                p->seq, p->payload_len, total_bytes_written);
 
                         if (total_bytes_written - last_report_bytes >= (long)(10 * MB)) {
@@ -261,7 +260,7 @@ int main(int argc, char *argv[]) {
                             gettimeofday(&last_report_time, NULL);
                         }
 
-                        if (p->type == MSG_FIN) {
+                        if (p->type == USER_MSG_FIN) {
                             double total_time    = Elapsed_sec(&xfer_start_time);
                             double file_size_mb  = total_bytes_written / MB;
                             double avg_rate_mbps = total_time > 0
@@ -351,8 +350,10 @@ static void Usage(int argc, char *argv[]) {
 
     if (!strncmp(argv[3], "WAN", 4)) {
         Mode = MODE_WAN;
+        WINDOW_SIZE = 4000;
     } else if (!strncmp(argv[3], "LAN", 4)) {
         Mode = MODE_LAN;
+        WINDOW_SIZE = 8;
     } else {
         Print_help();
     }
